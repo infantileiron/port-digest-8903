@@ -1,4 +1,4 @@
-import json,logging
+import json,logging,os
 from pathlib import Path
 from sqlalchemy import select
 from src.models.entities import Subscription,Receipt,Audit
@@ -21,6 +21,6 @@ def run_due(s,now):
  s.commit()
  for i in sent:
   try:
-   receipt=s.get(Receipt,i);Path('/artifacts/'+str(i)+'.json').write_text(json.dumps(receipt.payload,ensure_ascii=False,indent=2))
+   receipt=s.get(Receipt,i);Path(os.environ.get('ARTIFACT_DIR','/artifacts'),str(i)+'.json').write_text(json.dumps(receipt.payload,ensure_ascii=False,indent=2))
   except Exception:logging.exception('DB inbox delivered; optional artifact write failed')
  return sent

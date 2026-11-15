@@ -8,6 +8,7 @@ from src.routes.api import router
 from src.middlewares.request import RequestId,SecurityHeaders
 @asynccontextmanager
 async def lifespan(app):
+ # 空库直接建表；已有库由 scripts.migrate 幂等补齐补传/修订列。
  Base.metadata.create_all(engine)
  if os.getenv('SEED_DEMO')=='true':
   try:

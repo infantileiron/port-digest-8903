@@ -38,6 +38,7 @@ services:
   backend:
     <<: *app
     container_name: ${COMPOSE_PROJECT_NAME:-port-digest}-backend
+    command: [sh, -c, "python -m scripts.migrate && uvicorn src.main:app --host 0.0.0.0 --port 8000"]
     ports: ["${BACKEND_PORT:-19212}:8000"]
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]

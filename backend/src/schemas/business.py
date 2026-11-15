@@ -1,9 +1,11 @@
 import re
 from datetime import date
-from typing import Literal,Optional
+from typing import Any,Literal,Optional
 from pydantic import BaseModel,Field,field_validator,model_validator,ValidationInfo
 from src.utils.time import aware
+
 class Login(BaseModel):email:str;password:str
+
 class ArrivalInput(BaseModel):
  code:str=Field(min_length=1,max_length=60)
  station:Literal['北站','南站','东港']
@@ -19,6 +21,22 @@ class ArrivalInput(BaseModel):
  def range(self):
   if self.actual_at and abs((aware(self.actual_at)-aware(self.planned_at)).total_seconds())>3*86400:raise ValueError('实际与计划时间相差超过3天，请核对')
   return self
+
+class BatchInput(BaseModel):
+ """离线补传批次。rows 故意宽松：坏行由台账逐行隔离，不能拖累同批好行。"""
+ batch_key:str=Field(min_length=1,max_length=100)
+ source:str=Field(default='offline',max_length=80)
+ rows:list[Any]=Field(max_length=2000)
+ @field_validator('batch_key')
+ @classmethod
+ def key(cls,v):
+  if not re.fullmatch(r'[A-Za-z0-9._:\-]{1,100}',v):raise ValueError('批次编号只允许字母、数字、点、下划线、冒号和连字符')
+  return v
+
+class ReplayInput(BaseModel):
+ row:Any
+ batch_key:Optional[str]=Field(default=None,min_length=1,max_length=100)
+
 class SubscriptionInput(BaseModel):
  name:str=Field(min_length=2,max_length=100)
  station:Literal['全部','北站','南站','东港']='全部'
@@ -34,7 +52,9 @@ class SubscriptionInput(BaseModel):
  @field_validator('first_due_at')
  @classmethod
  def normalize(cls,v):return aware(v).isoformat() if v else None
+
 class PreviewInput(BaseModel):
  report_day:date
  station:Literal['全部','北站','南站','东港']='全部'
+
 class ReviewInput(BaseModel):note:str=Field(min_length=5,max_length=2000)

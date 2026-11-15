@@ -6,12 +6,12 @@
 
 临港联运运营北站、南站和东港三个港站，每天约150条班次记录。现行工作流是值班员导出 `临港到发_20261114.xlsx`，分析员按日期筛选后手算延误，负责人再把表格转发给下一班。痛点是跨午夜班次归错日、未到发被当准点、重复转发后分不清同一口径。上游为港站计划/实际到发记录；本项目替代日界归档、晨报试算和定时分发；下游为站内值班室交接班。
 
-三个核心实体：Arrival到发记录、Subscription晨报订阅、Receipt分发回执，另有用户和审计。四页：到发台账、晨报预览、订阅计划、分发回执。回执支持值班复核与下载，原始记录修订不改变已分发晨报。
+三个核心实体：Arrival到发记录、Subscription晨报订阅、Receipt分发回执，另有用户和审计；离线补传新增ArrivalBatch批次、ArrivalBatchItem批次行与ArrivalTombstone撤销墓碑。五页：到发台账、晨报预览、订阅计划、分发回执、补传批次。回执支持值班复核与下载，原始记录修订不改变已分发晨报。
 
 |角色|权限|典型动作|
 |---|---|---|
 |admin|全部；独占订阅配置/值班复核/审计|设定08:30晨报并核对回执|
-|analyst|到发录入/修订、晨报试算、读取计划回执、导出|补录跨午夜班次|
+|analyst|到发录入/修订、接收/完成补传批次、更正重放隔离项、晨报试算、读取计划回执、导出|补录跨午夜班次、处理离线补传|
 |viewer|业务只读与回执导出|下载冻结晨报；后端拒绝写入/计算|
 
 ## 快速启动
@@ -23,7 +23,7 @@ docker compose up -d --build
 docker compose exec -T backend python -m scripts.seed_demo
 ```
 
-前端 [localhost:18212](http://localhost:18212)，API [localhost:19212/docs](http://localhost:19212/docs)，PostgreSQL映射17712。账号 `admin@demo.local`、`analyst@demo.local`、`viewer@demo.local`，密码均 `Demo123!`。种子为3账号、150条昨日计划到发、3条暂停订阅；不会自动对外发送。自然编号幂等，重复运行不覆盖人工修订；种子日期为首次启动的昨日，后续日需业务录入新记录。
+前端 [localhost:18212](http://localhost:18212)，API [localhost:19212/docs](http://localhost:19212/docs)，PostgreSQL映射17712。账号 `admin@demo.local`、`analyst@demo.local`、`viewer@demo.local`，密码均 `Demo123!`。种子为3账号、150条昨日计划到发、3条暂停订阅；不会自动对外发送。自然编号幂等，重复运行不覆盖人工修订；种子日期为首次启动的昨日，后续日需业务录入新记录。后端启动时执行 `python -m scripts.migrate`，按文件名顺序幂等应用 migrations（001 基线在库已有 arrivals 时跳过，002 增补补传表与修订列）。
 
 ## 一日业务剧本
 
@@ -35,6 +35,24 @@ docker compose exec -T backend python -m scripts.seed_demo
 6. 08:30 worker每秒检查到点订阅，冻结昨日来源并写入回执。
 7. 08:31 刷新分发回执，核对P50/P95、完成/未到发人数和来源checksum。
 8. 08:35 admin 写入“跨日班次已核对”复核意见；viewer下载 `port-digest-<业务日>-<回执id>.json`。
+9. 09:00 analyst 在“补传批次”接收港站离线包：坏行只隔离本行并留原因，好行照常完成；输入条数必须等于生效+过旧+重复+隔离。隔离行可更正重放，原行原文与处理结果保留可追溯。
+
+## 离线补传、修订合并与隔离重放
+
+**班次身份** = 港站 + 班次编号 + 上海计划日。各站同编号班次按计划日区分，同编号跨站/跨日互不覆盖；历史 `code` 唯一约束由 `(station, code, planned_day)` 取代。人工录入/修订仍可随时进行，每次编辑递增台账修订号；身份（港站/编号/计划日）可迁移，旧身份立同修订号墓碑，低修订补传不能把原班次带回来。
+
+**批次生命周期** `receiving` → `completed`。接收阶段只落原始行并做结构校验（JSON对象、港站、编号、带偏移的计划/实际时间、3天范围、修订号、撤销标记），结构错误直接隔离并写明原因。完成阶段在单事务内逐行合并，每行必落到四类之一：
+
+|结果|条件|
+|---|---|
+|生效 applied|修订高于台账当前修订，或撤销修订高于已记录撤销水印|
+|过旧 stale|修订低于台账当前修订；或撤销后修订不高于撤销修订水印（旧修订不得复活班次）|
+|重复 duplicate|同号同版本且内容指纹一致|
+|隔离 quarantined|坏行；或同号同版本异内容；或台账缺少指纹无法判定|
+
+**乱序**先按班次身份分组、再按来源修订号降序合并，批内高修订先落地，低修订自然记为过旧。**撤销**写入墓碑水印（`revoked_revision`），撤销行本身不产生台账记录；撤销后只接受更高的修订号：补传行需高于撤销修订，人工编辑原记录也会生成更高的台账修订并把班次恢复；人工另建同一班次仍被拒绝（须先恢复原记录）。**条数守恒**在完成时强制校验 `输入条数 = 生效 + 过旧 + 重复 + 隔离`，不平则整批回滚并不标记完成。**重试**同批次编号同内容直接返回原批次（`created:false`），同编号异内容返回409；已完成批次再次完成返回 `processed:false`，不重复写入。**并发**用 PostgreSQL 事务级 advisory lock 按班次身份串行化合并，加上行锁与唯一约束；多批次争同班次最终保留最高来源修订，低修订记为过旧。**隔离重放**只接受已隔离且原批次已完成的行，生成独立重放批次，回填原行的 `resolved_by_item_id / resolution_status / resolved_at`；同一重放批次编号同内容可幂等重试，已解决的隔离行不能再次重放。`GET /arrival-batch-items/{id}/trace` 返回原行、原批次、全部重放行和最终处理结果。
+
+**晨报口径**只统计有效班次：撤销记录从台账读取时即排除，试算与到点回执都不计入。已分发回执payload冻结，后续补传、撤销或复核都不改变原值。`GET /arrivals?include_revoked=true` 仅admin可见撤销记录。
 
 ## 计算与调度口径
 
@@ -52,8 +70,8 @@ Python3.11/FastAPI/SQLAlchemy/PyJWT、原生ES modules/CSS、Nginx、PostgreSQL1
 
 `.env.example`列出COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO、NETWORK_SUBNET。显式子网10.253.113.0/24规避当前机默认地址池耗尽，可按环境调整。演示凭据应在正式部署替换。清理本项目用 `docker compose down -v --remove-orphans`。
 
-本地开发：启动db/redis，backend安装requirements，设置DATABASE_URL/REDIS_URL/JWT_SECRET，再运行 `uvicorn src.main:app --reload` 和 `python -m src.worker`；前端仍建议用Nginx同源代理。后端目录src按routes/controllers/services/models/schemas/middlewares/config/utils/constants分工；前端src按api/stores/pages/components/hooks/utils/constants/types/router分工。ORM首次建表，migrations保留实际初始DDL，无在线迁移执行器。
+本地开发：启动db/redis，backend安装requirements，设置DATABASE_URL/REDIS_URL/JWT_SECRET，先 `python -m scripts.migrate`，再运行 `uvicorn src.main:app --reload` 和 `python -m src.worker`；前端仍建议用Nginx同源代理。后端目录src按routes/controllers/services/models/schemas/middlewares/config/utils/constants分工；前端src按api/stores/pages/components/hooks/utils/constants/types/router分工。ORM建表用于空库，migrations是实际DDL来源，`scripts/migrate.py` 是幂等执行器。
 
-枚举：后端 `src/constants/enums.py`、`src/schemas/business.py` 与前端 `src/constants/enums.js` 定义ROLES、STATIONS、RECEIPT_STATES；TIMEZONE固定Asia/Shanghai。共用表格、表单、状态标签、晨报摘要组件；表单hooks、HTML转义和日期工具；请求ID/安全响应头两个中间件，业务审计与全局错误恢复。测试与截图在 `../../test-artifacts/gb-3113/`，不放源码内。
+枚举：后端 `src/constants/enums.py`、`src/schemas/business.py` 与前端 `src/constants/enums.js` 定义ROLES、STATIONS、RECEIPT_STATES、BATCH_STATES与BATCH_ITEM_STATES；TIMEZONE固定Asia/Shanghai。共用表格、表单、状态标签、晨报摘要组件；表单hooks、HTML转义和日期工具；请求ID/安全响应头两个中间件，业务审计与全局错误恢复。测试与截图在 `../../test-artifacts/gb-3113/`，不放源码内。
 
-范围：逐条录入/完整修订，无CSV导入、删除或分页；只有三个固定港站与上海时区。站内收件箱按名称记录，当前所有登录角色可读业务回执，无多租户邮箱隔离；不连接邮件、短信或外部IM。Google Fonts离线时字体回退。许可证MIT，见LICENSE。
+范围：逐条录入/完整修订，离线补传以JSON批次（最大2000行）接收，无CSV解析、删除或分页；只有三个固定港站与上海时区。补传来源修订号由上游提供，系统不生成；缺省视为修订0，因此撤销行应显式携带高于原记录的修订号。站内收件箱按名称记录，当前所有登录角色可读业务回执，无多租户邮箱隔离；不连接邮件、短信或外部IM。Google Fonts离线时字体回退。许可证MIT，见LICENSE。
